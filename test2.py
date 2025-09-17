@@ -16,8 +16,8 @@ from tensorflow.keras import layers, models, optimizers
 # -----------------------
 # CONFIG
 # -----------------------
-from airsim_config import REMOTE_IP, REMOTE_PORT
-PORT = REMOTE_PORT
+REMOTE_IP = "192.168.209.21"   # <<< REPLACE with Windows machine IP
+PORT = 41451
 IMG_H, IMG_W = 84, 84        # CNN input
 ACTION_DIM = 2               # continuous vx, vy (m/s)
 ACTION_SCALE = 3.0           # scale output to real m/s
@@ -39,7 +39,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # -----------------------
 class AirSimDroneEnv:
     def __init__(self, ip=REMOTE_IP, port=PORT, img_h=IMG_H, img_w=IMG_W, dt=DT):
-        self.client = airsim.MultirotorClient(ip=REMOTE_IP,port=PORT)
+        self.client = airsim.MultirotorClient(ip=ip, port=port)
         print("Connecting to AirSim at", ip, port)
         self.client.confirmConnection()
         self.client.enableApiControl(True)
@@ -80,7 +80,6 @@ class AirSimDroneEnv:
             self.client.enableApiControl(True)
             self.client.armDisarm(True)
             self.client.takeoffAsync().join()
-            self.client.moveToZAsync(-5, 2).join()
             time.sleep(0.2)
         except Exception as e:
             print("Reset warning:", e)
