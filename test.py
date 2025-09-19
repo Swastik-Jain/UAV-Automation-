@@ -11,7 +11,7 @@ import numpy as np
 import cv2
 import airsim
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers
+from keras import layers, models, optimizers
 
 # -----------------------
 # CONFIG
@@ -47,6 +47,7 @@ class AirSimDroneEnv:
         self.img_h = img_h
         self.img_w = img_w
         self.dt = dt
+        state = airsim.getMultirotarState()
         # small safety: ensure takeoff
         try:
             self.client.takeoffAsync().join()
@@ -74,11 +75,22 @@ class AirSimDroneEnv:
 
     def reset(self):
         # reset simulation / drone pose
+        x = np.random.uniform(-20,20)
+        y = np.random.uniform(-20,20)
+        z = np.random.uniform(-5,-10)
+
+        # Goal Co ordinates
+        gx = np.random.uniform(-20,20)
+        gy = np.random.uniform(-20,20)
+        gz = np.random.uniform(-5,-10)
+
         try:
             self.client.reset()
             time.sleep(0.2)
             self.client.enableApiControl(True)
             self.client.armDisarm(True)
+            self.client.simSetVehiclePose(airsim.Pose(airsim.Vector3r(x,y,z), airsim.Quaternionr(0,0,0)),ignore_collision=True)
+            self.goal=np.array([gx,gy,gz])
             self.client.takeoffAsync().join()
             self.client.moveToZAsync(-5, 2).join()
             time.sleep(0.2)
@@ -86,39 +98,45 @@ class AirSimDroneEnv:
             print("Reset warning:", e)
         return self._get_image()
 
-    def step(self, action):
-        """
-        action: np.array shape (2,) in [-1,1]; mapped to vx, vy
-        returns obs, reward, done, info
-        """
+    def compute_reward(self,vx,state,collided,action):
+        
+        pos = np.array([state.kinematics_estimated.position.x_val,
+                        state.kinematics_estimated.position.y_val,
+                        state.kinematics_estimated.position.z_val])
+        
+        dist= np.linalg.norm(pos-self.goal)
+        progress = self.prev_dist - dist
+        
+        if dist < self.goal_radius:  #goal reached
+            return 10,False,{'goal_reached':True}
+        
+        if collided: #collided 
+            return -10.0 ,True,{'collision' :True }
+        
+        else: # dense rewards 
+
+            reward = 0.01+0.001*max(0.0,vx)+0.01*progress -0.01*np.linalg.norm(action-self.prev_action)
+            self.prev_action = action
+            self.prev_dist = dist
+            return reward,False,{'collision' :False }
+        
+    def step(self,action):
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
-        # send velocity command for dt seconds and block
-        try:
-            self.client.moveByVelocityAsync(vx, vy, 0, duration=self.dt).join()
+
+        try :
+            self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt).join()
         except Exception as e:
-            print("moveByVelocityAsync exception:", e)
+            print("Step warning:", e)
 
         obs = self._get_image()
 
-        # reward: simple survival + forward progress proxy
-        # For City environment we don't have a specific goal by default.
-        # We'll use negative reward on collisions and small positive step reward.
-        colinfo = self.client.simGetCollisionInfo()
+        colinfo = self.client.getCollisionInfo()
         collided = colinfo.has_collided
-        reward = 0.0
-        done = False
-        info = {}
-        if collided:
-            reward = -10.0
-            done = True
-            info['collision'] = True
-        else:
-            # small reward for staying alive, encourage forward motion (vx)
-            reward = 0.01 + 0.01 * max(0.0, vx)  # encourage forward speed slightly
-            info['collision'] = False
 
-        return obs, reward, done, info
+        reward ,done ,info = self.compute_reward(vx,collided)
+        return obs,reward,done,info
+        
 
     def get_collision(self):
         return self.client.simGetCollisionInfo().has_collided

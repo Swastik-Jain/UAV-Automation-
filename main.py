@@ -81,7 +81,8 @@ class AirSimDroneEnv:
             return reward,False,{'collision' :False }
         
     def step(self,action):
-        vx,vy = action
+        vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
+        vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
 
         try :
             self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt).join()
