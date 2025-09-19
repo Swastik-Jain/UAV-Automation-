@@ -47,7 +47,12 @@ class AirSimDroneEnv:
         self.img_h = img_h
         self.img_w = img_w
         self.dt = dt
-        state = airsim.getMultirotarState()
+        self.goal_radius = 2.0
+        state = self.client.getMultirotorState()
+
+        self.prev_dist = None
+        self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
+
         # small safety: ensure takeoff
         try:
             self.client.takeoffAsync().join()
@@ -89,13 +94,28 @@ class AirSimDroneEnv:
             time.sleep(0.2)
             self.client.enableApiControl(True)
             self.client.armDisarm(True)
-            self.client.simSetVehiclePose(airsim.Pose(airsim.Vector3r(x,y,z), airsim.Quaternionr(0,0,0)),ignore_collision=True)
-            self.goal=np.array([gx,gy,gz])
+
+            quat = airsim.to_quaternion(0,0,0)
+            pose = airsim.Pose(airsim.Vector3r(x,y,z),quat)
+            self.client.simSetVehiclePose(pose,ignore_collision=True)
+
+
+            self.goal=np.array([gx,gy,gz],dtype=np.float32)
+            self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
+            self.prev_dist = np.linalg.norm(np.array([x,y,z])-self.goal)
+
             self.client.takeoffAsync().join()
-            self.client.moveToZAsync(-5, 2).join()
+            try:
+                self.client.moveToZAsync(-5, 2).join()
+            except Exception:
+                # ignore if moveToZAsync fails (depends on start z)
+                pass
+
             time.sleep(0.2)
+
         except Exception as e:
             print("Reset warning:", e)
+
         return self._get_image()
 
     def compute_reward(self,vx,state,collided,action):
@@ -108,19 +128,22 @@ class AirSimDroneEnv:
         progress = self.prev_dist - dist
         
         if dist < self.goal_radius:  #goal reached
-            return 10,False,{'goal_reached':True}
+            return 10,True,{'goal_reached':True}
         
         if collided: #collided 
             return -10.0 ,True,{'collision' :True }
         
-        else: # dense rewards 
-
-            reward = 0.01+0.001*max(0.0,vx)+0.01*progress -0.01*np.linalg.norm(action-self.prev_action)
-            self.prev_action = action
-            self.prev_dist = dist
-            return reward,False,{'collision' :False }
+        reward =0.0 #initial
+        reward += 0.01 # survival
+        reward += 0.001*max(0.0,vx)#velocity motivation
+        reward += 0.01*progress  #progress
+        reward -= 0.01*np.linalg.norm(action-self.prev_action)#smoothness
+            
+        self.prev_action = action
+        self.prev_dist = dist
+        return reward,False,{'collision' :False }
         
-    def step(self,action):
+    def step(self,state,action):
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
 
@@ -131,10 +154,10 @@ class AirSimDroneEnv:
 
         obs = self._get_image()
 
-        colinfo = self.client.getCollisionInfo()
+        colinfo = self.client.simGetCollisionInfo()
         collided = colinfo.has_collided
 
-        reward ,done ,info = self.compute_reward(vx,collided)
+        reward ,done ,info = self.compute_reward(vx,state,collided,action)
         return obs,reward,done,info
         
 
