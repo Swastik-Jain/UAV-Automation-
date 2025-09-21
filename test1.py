@@ -16,8 +16,8 @@ from keras import layers, models, optimizers
 # -----------------------
 # CONFIG
 # -----------------------
-from airsim_config import REMOTE_IP, REMOTE_PORT
-PORT = REMOTE_PORT
+REMOTE_IP = "127.0.0.1"   # <<< R120EPLACE with Windows machine IP
+PORT = 41451
 IMG_H, IMG_W = 84, 84        # CNN input
 ACTION_DIM = 2               # continuous vx, vy (m/s)
 ACTION_SCALE = 3.0           # scale output to real m/s
@@ -31,6 +31,7 @@ CLIP_EPS = 0.2
 LR = 3e-4
 MAX_TRAIN_ITERS = 1000
 SAVE_DIR = "ppo_airsim_checkpoints"
+GOAL_POS = np.array([50.0, 0.0, -5.0])
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -47,12 +48,6 @@ class AirSimDroneEnv:
         self.img_h = img_h
         self.img_w = img_w
         self.dt = dt
-        self.goal_radius = 2.0
-        state = self.client.getMultirotorState()
-
-        self.prev_dist = None
-        self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
-
         # small safety: ensure takeoff
         try:
             self.client.takeoffAsync().join()
@@ -80,95 +75,61 @@ class AirSimDroneEnv:
 
     def reset(self):
         # reset simulation / drone pose
-        x = np.random.uniform(-20,20)
-        y = np.random.uniform(-20,20)
-        z = np.random.uniform(-5,-10)
-
-        # Goal Co ordinates
-        gx = np.random.uniform(-20,20)
-        gy = np.random.uniform(-20,20)
-        gz = np.random.uniform(-5,-10)
-
         try:
             self.client.reset()
             time.sleep(0.2)
             self.client.enableApiControl(True)
             self.client.armDisarm(True)
-
-            quat = airsim.to_quaternion(0,0,0)
-            pose = airsim.Pose(airsim.Vector3r(x,y,z),quat)
-            self.client.simSetVehiclePose(pose,ignore_collision=True)
-
-
-            self.goal=np.array([gx,gy,gz],dtype=np.float32)
-            self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
-            self.prev_dist = np.linalg.norm(np.array([x,y,z])-self.goal)
-
             self.client.takeoffAsync().join()
-            try:
-                self.client.moveToZAsync(-5, 2).join()
-            except Exception:
-                # ignore if moveToZAsync fails (depends on start z)
-                pass
-
+            self.client.moveToZAsync(-5, 2).join()
             time.sleep(0.2)
-
         except Exception as e:
             print("Reset warning:", e)
-
         return self._get_image()
 
-    def compute_reward(self,vx,state,collided,action):
-        
-        pos = np.array([state.kinematics_estimated.position.x_val,
-                        state.kinematics_estimated.position.y_val,
-                        state.kinematics_estimated.position.z_val])
-        
-        dist= np.linalg.norm(pos-self.goal)
-        progress = self.prev_dist - dist
-        
-        if dist < self.goal_radius:  #goal reached
-            return 10,True,{'goal_reached':True}
-        
-        if collided: #collided 
-            return -10.0 ,True,{'collision' :True }
-        
-        reward =0.0 #initial
-        reward += 0.01 # survival
-        reward += 0.001*max(0.0,vx)#velocity motivation
-        reward += 0.01*progress  #progress
-        reward -= 0.01*np.linalg.norm(action-self.prev_action)#smoothness
-            
-        self.prev_action = action
-        self.prev_dist = dist
-        return reward,False,{'collision' :False }
-        
-    def step(self,state,action):
+    def step(self, action):
+        """
+        action: np.array shape (2,) in [-1,1]; mapped to vx, vy
+        returns obs, reward, done, info
+        """
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
-
-        try :
-            self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt).join()
+        # send velocity command for dt seconds and block
+        try:
+         self.client.moveByVelocityZAsync(vx, vy, GOAL_POS[2], duration=self.dt).join()
         except Exception as e:
-            print("Step warning:", e)
+         print("moveByVelocityZAsync exception:", e)
 
         obs = self._get_image()
 
+        # reward: simple survival + forward progress proxy
+        # For City environment we don't have a specific goal by default.
+        # We'll use negative reward on collisions and small positive step reward.
+        pos = self.client.getMultirotorState().kinematics_estimated.position
+        drone_pos = np.array([pos.x_val, pos.y_val, pos.z_val])
+        dist_to_goal = np.linalg.norm(drone_pos - GOAL_POS)
+
+        reward = -0.01 * dist_to_goal   # encourage being closer
+        done = False
+        info = {}
+
+        #check collision
         colinfo = self.client.simGetCollisionInfo()
-        collided = colinfo.has_collided
-
-        reward ,done ,info = self.compute_reward(vx,state,collided,action)
-        return obs,reward,done,info
+        if colinfo.has_collided:
+            reward = -20.0
+            done = True
+            info['collision'] = True
         
+        # check goal
+        elif dist_to_goal < 2.0:  # within 2m of goal
+          reward = +50.0
+          done = True
+          info['goal_reached'] = True
+        else:
+          info['collision'] = False
+          info['goal_reached'] = False
 
-    def get_collision(self):
-        return self.client.simGetCollisionInfo().has_collided
-
-    def close(self):
-        try:
-            self.client.reset()
-        except:
-            pass
+        return obs, reward, done, info
 
 # -----------------------
 # MODEL: CNN Encoder + ActorCritic (Keras)
