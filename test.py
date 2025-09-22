@@ -34,6 +34,8 @@ CLIP_EPS = 0.2
 LR = 3e-4
 MAX_TRAIN_ITERS = 80
 SAVE_DIR = "ppo_airsim_checkpoints"
+TIME_PENALTY = 0.005          # per-step time penalty
+TIME_LIMIT_PENALTY = 1.0      # additional penalty when episode ends due to time limit
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -55,6 +57,9 @@ class AirSimDroneEnv:
 
         self.prev_dist = None
         self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
+        # episode management
+        self.max_steps = 500
+        self.step_count = 0
 
         # small safety: ensure takeoff
         try:
@@ -106,6 +111,7 @@ class AirSimDroneEnv:
             self.goal=np.array([gx,gy,gz],dtype=np.float32)
             self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
             self.prev_dist = np.linalg.norm(np.array([x,y,z])-self.goal)
+            self.step_count = 0
 
             self.client.takeoffAsync().join()
             try:
@@ -136,8 +142,9 @@ class AirSimDroneEnv:
         if collided: #collided 
             return -10.0 ,True,{'collision' :True }
         
-        reward =0.0 #initial
-        reward += 0.01 # survival
+        reward = 0.0
+        # per-step time penalty to encourage faster completion
+        reward -= TIME_PENALTY
         reward += 0.001*max(0.0,vx)#velocity motivation
         reward += 0.01*progress  #progress
         reward -= 0.01*np.linalg.norm(action-self.prev_action)#smoothness
@@ -147,21 +154,32 @@ class AirSimDroneEnv:
         return reward,False,{'collision' :False }
         
     def step(self,action):
-        state = self.client.getMultirotorState()
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
+
 
         try :
             self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt).join()
         except Exception as e:
             print("Step warning:", e)
 
+        # increment step counter for time-limit termination
+        self.step_count += 1
+
         obs = self._get_image()
 
         colinfo = self.client.simGetCollisionInfo()
         collided = colinfo.has_collided
 
+
+        state = self.client.getMultirotorState()
         reward ,done ,info = self.compute_reward(vx,state,collided,action)
+        # time-limit termination
+        if not done and self.step_count >= self.max_steps:
+            done = True
+            info = dict(info)
+            info['time_limit'] = True
+            reward -= TIME_LIMIT_PENALTY
         return obs,reward,done,info
         
 
