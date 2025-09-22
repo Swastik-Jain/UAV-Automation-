@@ -16,7 +16,10 @@ from keras import layers, models, optimizers
 # -----------------------
 # CONFIG
 # -----------------------
-from airsim_config import REMOTE_IP, REMOTE_PORT
+# from airsim_config import REMOTE_IP, REMOTE_PORT
+REMOTE_IP = "127.0.0.1"
+REMOTE_PORT = 41451
+
 PORT = REMOTE_PORT
 IMG_H, IMG_W = 84, 84        # CNN input
 ACTION_DIM = 2               # continuous vx, vy (m/s)
@@ -29,7 +32,7 @@ GAMMA = 0.99
 LAM = 0.95
 CLIP_EPS = 0.2
 LR = 3e-4
-MAX_TRAIN_ITERS = 1000
+MAX_TRAIN_ITERS = 80
 SAVE_DIR = "ppo_airsim_checkpoints"
 
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -143,7 +146,8 @@ class AirSimDroneEnv:
         self.prev_dist = dist
         return reward,False,{'collision' :False }
         
-    def step(self,state,action):
+    def step(self,action):
+        state = self.client.getMultirotorState()
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
 
