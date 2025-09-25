@@ -16,11 +16,8 @@ from keras import layers, models, optimizers
 # -----------------------
 # CONFIG
 # -----------------------
-# from airsim_config import REMOTE_IP, REMOTE_PORT
-REMOTE_IP = "127.0.0.1"
-REMOTE_PORT = 41451
-
-PORT = REMOTE_PORT
+REMOTE_IP = "127.0.0.1"   # <<< R120EPLACE with Windows machine IP
+PORT = 41451
 IMG_H, IMG_W = 84, 84        # CNN input
 ACTION_DIM = 2               # continuous vx, vy (m/s)
 ACTION_SCALE = 3.0           # scale output to real m/s
@@ -32,10 +29,9 @@ GAMMA = 0.99
 LAM = 0.95
 CLIP_EPS = 0.2
 LR = 3e-4
-MAX_TRAIN_ITERS = 80
+MAX_TRAIN_ITERS = 1000
 SAVE_DIR = "ppo_airsim_checkpoints"
-TIME_PENALTY = 0.005          # per-step time penalty
-TIME_LIMIT_PENALTY = 1.0      # additional penalty when episode ends due to time limit
+GOAL_POS = np.array([50.0, 0.0, -5.0])
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -52,15 +48,6 @@ class AirSimDroneEnv:
         self.img_h = img_h
         self.img_w = img_w
         self.dt = dt
-        self.goal_radius = 2.0
-        state = self.client.getMultirotorState()
-
-        self.prev_dist = None
-        self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
-        # episode management
-        # self.max_steps = 500  <------------------------------------------->
-        self.step_count = 0
-
         # small safety: ensure takeoff
         try:
             self.client.takeoffAsync().join()
@@ -88,138 +75,80 @@ class AirSimDroneEnv:
 
     def reset(self):
         # reset simulation / drone pose
-        x = np.random.uniform(-20,20)
-        y = np.random.uniform(-20,20)
-        z = -5.0
-
-        # Goal Co ordinates
-        gx = np.random.uniform(-20,20)
-        gy = np.random.uniform(-20,20)
-        gz = -5.0
-
         try:
             self.client.reset()
             time.sleep(0.2)
             self.client.enableApiControl(True)
             self.client.armDisarm(True)
-
-            quat = airsim.to_quaternion(0,0,0)
-            pose = airsim.Pose(airsim.Vector3r(x,y,z),quat)
-            self.client.simSetVehiclePose(pose,ignore_collision=True)
-
-
-            self.goal=np.array([gx,gy,gz],dtype=np.float32)
-            self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
-            # prev_dist will be set after altitude is established
-            self.prev_dist = None
-            self.step_count = 0
-
             self.client.takeoffAsync().join()
-            try:
-                self.client.moveToZAsync(-5, 2).join()
-            except Exception:
-                # ignore if moveToZAsync fails (depends on start z)
-                pass
-
+            self.client.moveToZAsync(-5, 2).join()
             time.sleep(0.2)
-            # Initialize previous horizontal distance after altitude settle
-            state_now = self.client.getMultirotorState()
-            pos_now = np.array([
-                state_now.kinematics_estimated.position.x_val,
-                state_now.kinematics_estimated.position.y_val,
-                state_now.kinematics_estimated.position.z_val
-            ], dtype=np.float32)
-            self.prev_dist = np.linalg.norm((pos_now[:2] - self.goal[:2]))
-
         except Exception as e:
             print("Reset warning:", e)
+         
+        # --- clear previous distance tracker (important for reward shaping) ---
+
+        if hasattr(self, "prev_dist"):
+          del self.prev_dist
 
         return self._get_image()
+    
 
-    def compute_reward(self,vx,state,collided,action):
-        
-        pos = np.array([state.kinematics_estimated.position.x_val,
-                        state.kinematics_estimated.position.y_val,
-                        state.kinematics_estimated.position.z_val], dtype=np.float32)
-        # Use horizontal distance only since control is in x,y
-        pos_xy = pos[:2]
-        goal_xy = self.goal[:2]
-        dist = np.linalg.norm(pos_xy - goal_xy)
-        # Ensure prev_dist is initialized (e.g., first step after reset)
-        if self.prev_dist is None:
-            self.prev_dist = dist
-        progress = self.prev_dist - dist
-        
-        if dist < self.goal_radius:  #goal reached
-            return 10,True,{'goal_reached':True}
-        
-        if collided: #collided 
-            return -10.0 ,True,{'collision' :True }
-        
-        reward = 0.0
-        # per-step time penalty to encourage faster completion
-        reward -= TIME_PENALTY
-        # progress toward goal in horizontal plane
-        reward += 0.01 * progress
-        # encourage velocity alignment toward goal direction (horizontal)
-        dir_vec = goal_xy - pos_xy
-        dir_norm = np.linalg.norm(dir_vec) + 1e-8
-        dir_unit = dir_vec / dir_norm
-        # commanded horizontal velocity vector (m/s)
-        v_vec = np.array([
-            float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE),
-            float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
-        ], dtype=np.float32)
-        speed = np.linalg.norm(v_vec)
-        if speed > 1e-6:
-            vel_unit = v_vec / speed
-            alignment = float(np.dot(vel_unit, dir_unit))  # cosine in [-1, 1]
-            reward += 0.002 * speed * alignment
-        # action smoothness
-        reward -= 0.01 * np.linalg.norm(action - self.prev_action)
-            
-        self.prev_action = action
-        self.prev_dist = dist
-        return reward,False,{'collision' :False }
-        
-    def step(self,action):
+
+
+    def step(self, action):
+        """
+        action: np.array shape (2,) in [-1,1]; mapped to vx, vy
+        returns obs, reward, done, info
+        """
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
-
-
-        try :
-            self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt).join()
+        # send velocity command for dt seconds and block
+        try:
+         self.client.moveByVelocityZAsync(vx, vy, GOAL_POS[2], duration=self.dt).join()
         except Exception as e:
-            print("Step warning:", e)
-
-        # increment step counter for time-limit termination
-        self.step_count += 1
+         print("moveByVelocityZAsync exception:", e)
 
         obs = self._get_image()
 
-        colinfo = self.client.simGetCollisionInfo()
-        collided = colinfo.has_collided
+        # reward: simple survival + forward progress proxy
+        # For City environment we don't have a specific goal by default.
+        # We'll use negative reward on collisions and small positive step reward.
+        pos = self.client.getMultirotorState().kinematics_estimated.position
+        drone_pos = np.array([pos.x_val, pos.y_val, pos.z_val])
+        dist_to_goal = np.linalg.norm(drone_pos - GOAL_POS)
 
+        # reward = -0.01 * dist_to_goal   # encourage being closer <--------------
+        # done = False
+        # info = {}                ----------------------------------------------->
 
-        state = self.client.getMultirotorState()
-        reward ,done ,info = self.compute_reward(vx,state,collided,action)
-        # time-limit termination
-        # if not done and self.step_count >= self.max_steps:  <-----------------------------------
-        #     done = True
-        #     info = dict(info)
-        #     info['time_limit'] = True
-        #     reward -= TIME_LIMIT_PENALTY    ---------------------------------------------------->
-        return obs,reward,done,info
+        info = {"collision" : False, "goal_reached" : False}
+        done = False
+
+        if not hasattr(self,"prev_dist"):   #  first step
+            self.prev_dist = dist_to_goal
         
+        progress = self.prev_dist - dist_to_goal   # +ve if closer, -ve if farrther
+        reward = progress * 10.0                   # scale it
 
-    def get_collision(self):
-        return self.client.simGetCollisionInfo().has_collided
+        # penalties/bonuses
 
-    def close(self):
-        try:
-            self.client.reset()
-        except:
-            pass
+        colinfo = self.client.simGetCollisionInfo()
+        if colinfo.has_collided:
+            reward = -30.0
+            done = True
+            info['collision'] = True
+        
+        # check goal
+        elif dist_to_goal < 2.0:  # within 2m of goal
+          reward = +50.0
+          done = True
+          info['goal_reached'] = True
+
+        # update prev distance
+        self.prev_dist = dist_to_goal
+
+        return obs, reward, done, info
 
 # -----------------------
 # MODEL: CNN Encoder + ActorCritic (Keras)
