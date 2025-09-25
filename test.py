@@ -90,12 +90,12 @@ class AirSimDroneEnv:
         # reset simulation / drone pose
         x = np.random.uniform(-20,20)
         y = np.random.uniform(-20,20)
-        z = np.random.uniform(-5,-10)
+        z = -5.0
 
         # Goal Co ordinates
         gx = np.random.uniform(-20,20)
         gy = np.random.uniform(-20,20)
-        gz = np.random.uniform(-5,-10)
+        gz = -5.0
 
         try:
             self.client.reset()
@@ -110,7 +110,8 @@ class AirSimDroneEnv:
 
             self.goal=np.array([gx,gy,gz],dtype=np.float32)
             self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
-            self.prev_dist = np.linalg.norm(np.array([x,y,z])-self.goal)
+            # prev_dist will be set after altitude is established
+            self.prev_dist = None
             self.step_count = 0
 
             self.client.takeoffAsync().join()
@@ -121,6 +122,14 @@ class AirSimDroneEnv:
                 pass
 
             time.sleep(0.2)
+            # Initialize previous horizontal distance after altitude settle
+            state_now = self.client.getMultirotorState()
+            pos_now = np.array([
+                state_now.kinematics_estimated.position.x_val,
+                state_now.kinematics_estimated.position.y_val,
+                state_now.kinematics_estimated.position.z_val
+            ], dtype=np.float32)
+            self.prev_dist = np.linalg.norm((pos_now[:2] - self.goal[:2]))
 
         except Exception as e:
             print("Reset warning:", e)
@@ -131,9 +140,14 @@ class AirSimDroneEnv:
         
         pos = np.array([state.kinematics_estimated.position.x_val,
                         state.kinematics_estimated.position.y_val,
-                        state.kinematics_estimated.position.z_val])
-        
-        dist= np.linalg.norm(pos-self.goal)
+                        state.kinematics_estimated.position.z_val], dtype=np.float32)
+        # Use horizontal distance only since control is in x,y
+        pos_xy = pos[:2]
+        goal_xy = self.goal[:2]
+        dist = np.linalg.norm(pos_xy - goal_xy)
+        # Ensure prev_dist is initialized (e.g., first step after reset)
+        if self.prev_dist is None:
+            self.prev_dist = dist
         progress = self.prev_dist - dist
         
         if dist < self.goal_radius:  #goal reached
@@ -145,9 +159,24 @@ class AirSimDroneEnv:
         reward = 0.0
         # per-step time penalty to encourage faster completion
         reward -= TIME_PENALTY
-        reward += 0.001*max(0.0,vx)#velocity motivation
-        reward += 0.01*progress  #progress
-        reward -= 0.01*np.linalg.norm(action-self.prev_action)#smoothness
+        # progress toward goal in horizontal plane
+        reward += 0.01 * progress
+        # encourage velocity alignment toward goal direction (horizontal)
+        dir_vec = goal_xy - pos_xy
+        dir_norm = np.linalg.norm(dir_vec) + 1e-8
+        dir_unit = dir_vec / dir_norm
+        # commanded horizontal velocity vector (m/s)
+        v_vec = np.array([
+            float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE),
+            float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
+        ], dtype=np.float32)
+        speed = np.linalg.norm(v_vec)
+        if speed > 1e-6:
+            vel_unit = v_vec / speed
+            alignment = float(np.dot(vel_unit, dir_unit))  # cosine in [-1, 1]
+            reward += 0.002 * speed * alignment
+        # action smoothness
+        reward -= 0.01 * np.linalg.norm(action - self.prev_action)
             
         self.prev_action = action
         self.prev_dist = dist
