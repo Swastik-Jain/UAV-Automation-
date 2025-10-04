@@ -7,11 +7,13 @@ Replace REMOTE_IP with your AirSim server IP.
 import os
 import time
 import math
+# Removed incorrect import
 import numpy as np
 import cv2
 import airsim
 import tensorflow as tf
 from keras import layers, models, optimizers
+from collections import deque
 
 # -----------------------
 # CONFIG
@@ -21,58 +23,61 @@ REMOTE_IP = "127.0.0.1"
 REMOTE_PORT = 41451
 
 PORT = REMOTE_PORT
-IMG_H, IMG_W = 84, 84        # CNN input
-ACTION_DIM = 2               # continuous vx, vy (m/s)
-ACTION_SCALE = 3.0           # scale output to real m/s
-DT = 0.3                     # command duration (seconds)
-ROLLOUT_STEPS = 1024         # steps per update
-MINIBATCH_SIZE = 64
+NUM_DRONES = 3
+
+#------------Environment Parameters------------
+# --- Environment ---
+IMG_H, IMG_W = 84, 84
+ACTION_DIM = 2
+ACTION_SCALE = 3.0
+DT = 0.3
+
+MIN_DIST_TO_GOAL = 5.0
+GOAL_RADIUS = 2.0
+
+# --- Reward Coefficients ---
+GOAL_REWARD = 5.0
+COLLISION_PENALTY = -5.0
+TIME_LIMIT_PENALTY = -1.0
+TIME_PENALTY = -0.01
+PROGRESS_COEFF = 2.5
+ALIGNMENT_COEFF = 0.1
+SMOOTHNESS_PENALTY_WEIGHT = 0.01
+
+# --- PPO Hyperparameters ---
+ROLLOUT_STEPS = 512           # Steps per agent per update
+MINIBATCH_SIZE = 64 * NUM_DRONES
 UPDATE_EPOCHS = 8
 GAMMA = 0.99
 LAM = 0.95
 CLIP_EPS = 0.2
 LR = 3e-4
-MAX_TRAIN_ITERS = 80
+MAX_TRAIN_ITERS = 1000
 SAVE_DIR = "ppo_airsim_checkpoints"
-TIME_PENALTY = 0.005          # per-step time penalty
-TIME_LIMIT_PENALTY = 1.0      # additional penalty when episode ends due to time limit
-
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # -----------------------
 # AIRSIM ENV WRAPPER
 # -----------------------
 class AirSimDroneEnv:
-    def __init__(self, ip=REMOTE_IP, port=PORT, img_h=IMG_H, img_w=IMG_W, dt=DT):
-        self.client = airsim.MultirotorClient(ip=REMOTE_IP,port=PORT)
-        print("Connecting to AirSim at", ip, port)
-        self.client.confirmConnection()
-        self.client.enableApiControl(True)
-        self.client.armDisarm(True)
+    def __init__(self,client,vehicle_name, ip=REMOTE_IP, port=PORT, img_h=IMG_H, img_w=IMG_W, dt=DT):
+        self.vehicle_name = vehicle_name
+        self.client = client
         self.img_h = img_h
         self.img_w = img_w
         self.dt = dt
-        self.goal_radius = 2.0
-        state = self.client.getMultirotorState()
-
         self.prev_dist = None
         self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
         # episode management
         # self.max_steps = 500  <------------------------------------------->
         self.step_count = 0
 
-        # small safety: ensure takeoff
-        try:
-            self.client.takeoffAsync().join()
-            time.sleep(0.5)
-        except Exception as e:
-            print("Warning: takeoff failed (maybe already flying).", e)
-
+        
     def _get_image(self):
         # returns HxWx3 float32 [0,1]
         responses = self.client.simGetImages([
             airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
-        ])
+        ],vehicle_name=self.vehicle_name)
         if len(responses) == 0:
             raise RuntimeError("No image returned from AirSim.")
         resp = responses[0]
@@ -88,55 +93,48 @@ class AirSimDroneEnv:
 
     def reset(self):
         # reset simulation / drone pose
-        x = np.random.uniform(-20,20)
-        y = np.random.uniform(-20,20)
-        z = -5.0
+        while True:
+            x = np.random.uniform(-20,20)
+            y = np.random.uniform(-20,20)
+            z = -5.0
 
-        # Goal Co ordinates
-        gx = np.random.uniform(-20,20)
-        gy = np.random.uniform(-20,20)
-        gz = -5.0
+            # Goal Co ordinates
+            gx = np.random.uniform(-20,20)
+            gy = np.random.uniform(-20,20)
+            gz = -5.0
 
-        try:
-            self.client.reset()
-            time.sleep(0.2)
-            self.client.enableApiControl(True)
-            self.client.armDisarm(True)
+            if np.linalg.norm(np.array([x,y,z]) - np.array([gx,gy,gz])) > MIN_DIST_TO_GOAL:
+                break
+            
+        quat = airsim.to_quaternion(0,0,0)
+        pose = airsim.Pose(airsim.Vector3r(x,y,z),quat)
+        self.client.simSetVehiclePose(pose,ignore_collision=True,vehicle_name=self.vehicle_name)
 
-            quat = airsim.to_quaternion(0,0,0)
-            pose = airsim.Pose(airsim.Vector3r(x,y,z),quat)
-            self.client.simSetVehiclePose(pose,ignore_collision=True)
+        self.goal=np.array([gx,gy,gz],dtype=np.float32)
+        self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
+        self.step_count = 0
 
+        self.client.enableApiControl(True, vehicle_name=self.vehicle_name)
+        self.client.armDisarm(True, vehicle_name=self.vehicle_name)
+        
 
-            self.goal=np.array([gx,gy,gz],dtype=np.float32)
-            self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
-            # prev_dist will be set after altitude is established
-            self.prev_dist = None
-            self.step_count = 0
+        if(self.client.simGetCollisionInfo(vehicle_name=self.vehicle_name).has_collided):
+            print("Spawned in a collided state! Retrying reset...")
+            return self.reset()
+        self.client.takeoffAsync(vehicle_name=self.vehicle_name).join()
 
-            self.client.takeoffAsync().join()
-            try:
-                self.client.moveToZAsync(-5, 2).join()
-            except Exception:
-                # ignore if moveToZAsync fails (depends on start z)
-                pass
-
-            time.sleep(0.2)
-            # Initialize previous horizontal distance after altitude settle
-            state_now = self.client.getMultirotorState()
-            pos_now = np.array([
-                state_now.kinematics_estimated.position.x_val,
-                state_now.kinematics_estimated.position.y_val,
-                state_now.kinematics_estimated.position.z_val
-            ], dtype=np.float32)
-            self.prev_dist = np.linalg.norm((pos_now[:2] - self.goal[:2]))
-
-        except Exception as e:
-            print("Reset warning:", e)
-
+        # Initialize previous horizontal distance after altitude settle
+        state_now = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        pos_now = np.array([
+            state_now.kinematics_estimated.position.x_val,
+            state_now.kinematics_estimated.position.y_val,
+            state_now.kinematics_estimated.position.z_val
+        ], dtype=np.float32)
+        self.prev_dist = np.linalg.norm((pos_now[:2] - self.goal[:2]))
+        
         return self._get_image()
 
-    def compute_reward(self,vx,state,collided,action):
+    def compute_reward(self,state,collided,action):
         
         pos = np.array([state.kinematics_estimated.position.x_val,
                         state.kinematics_estimated.position.y_val,
@@ -150,21 +148,26 @@ class AirSimDroneEnv:
             self.prev_dist = dist
         progress = self.prev_dist - dist
         
-        if dist < self.goal_radius:  #goal reached
-            return 10,True,{'goal_reached':True}
+        if dist < GOAL_RADIUS:  #goal reached
+            print("Goal reached")
+            return GOAL_REWARD,True,{'goal_reached':True}
         
         if collided: #collided 
-            return -10.0 ,True,{'collision' :True }
+            print("Collided")
+            return COLLISION_PENALTY ,True,{'collision' :True }
         
         reward = 0.0
         # per-step time penalty to encourage faster completion
         reward -= TIME_PENALTY
+
         # progress toward goal in horizontal plane
-        reward += 0.01 * progress
+        reward += PROGRESS_COEFF * progress
+
         # encourage velocity alignment toward goal direction (horizontal)
         dir_vec = goal_xy - pos_xy
         dir_norm = np.linalg.norm(dir_vec) + 1e-8
         dir_unit = dir_vec / dir_norm
+
         # commanded horizontal velocity vector (m/s)
         v_vec = np.array([
             float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE),
@@ -174,9 +177,10 @@ class AirSimDroneEnv:
         if speed > 1e-6:
             vel_unit = v_vec / speed
             alignment = float(np.dot(vel_unit, dir_unit))  # cosine in [-1, 1]
-            reward += 0.002 * speed * alignment
+            reward += ALIGNMENT_COEFF * speed * alignment
+
         # action smoothness
-        reward -= 0.01 * np.linalg.norm(action - self.prev_action)
+        reward -= SMOOTHNESS_PENALTY_WEIGHT * np.linalg.norm(action - self.prev_action)
             
         self.prev_action = action
         self.prev_dist = dist
@@ -186,9 +190,10 @@ class AirSimDroneEnv:
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
         vy = float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
 
+        
 
         try :
-            self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt).join()
+            self.client.moveByVelocityAsync(vx,vy,0,duration=self.dt,vehicle_name=self.vehicle_name).join()
         except Exception as e:
             print("Step warning:", e)
 
@@ -197,29 +202,88 @@ class AirSimDroneEnv:
 
         obs = self._get_image()
 
-        colinfo = self.client.simGetCollisionInfo()
+        colinfo = self.client.simGetCollisionInfo(vehicle_name=self.vehicle_name)
         collided = colinfo.has_collided
 
 
-        state = self.client.getMultirotorState()
-        reward ,done ,info = self.compute_reward(vx,state,collided,action)
+        state = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        reward ,done ,info = self.compute_reward(state,collided,action)
         # time-limit termination
-        # if not done and self.step_count >= self.max_steps:  <-----------------------------------
-        #     done = True
-        #     info = dict(info)
-        #     info['time_limit'] = True
-        #     reward -= TIME_LIMIT_PENALTY    ---------------------------------------------------->
+        if not done and self.step_count >= self.max_steps:
+            done = True
+            info = dict(info)
+            info['time_limit'] = True
+            reward -= TIME_LIMIT_PENALTY
         return obs,reward,done,info
         
 
     def get_collision(self):
-        return self.client.simGetCollisionInfo().has_collided
+        return self.client.simGetCollisionInfo(vehicle_name=self.vehicle_name).has_collided
 
     def close(self):
         try:
-            self.client.reset()
+            self.client.reset(vehicle_name=self.vehicle_name)
         except:
             pass
+
+
+# -----------------------
+# VECTORIZED ENV WRAPPER (Manages all drones)
+# -----------------------
+class VectorizedAirSimEnv:
+    def __init__(self,num_drones):
+
+        self.num_drones = num_drones
+        self.drone_names = [f"Drone{i+1}" for i in range(num_drones)]
+        
+        self.client = airsim.MultirotorClient(ip=REMOTE_IP, port=PORT)
+        print("Connecting to AirSim...")
+        self.client.confirmConnection()
+
+        self.envs = [AirSimDroneEnv(self.client,name)for name in self.drone_names]
+
+    def reset(self):
+        obs_list=[env.reset()for env in self.envs]
+        return np.stack(obs_list)
+
+    def step(self,actions):
+        for i , env in enumerate(self.envs):
+            action = actions[i]
+            vx = float(np.clip(action[0],-1.0,1.0)*ACTION_SCALE)
+            vy = float(np.clip(action[1],-1.0,1.0)*ACTION_SCALE)
+            self.client.moveByVelocityAsync(vx,vy,duration =DT,vehicle_name = env.vehicle_name)
+
+        time.sleep(DT)
+
+        obs_batch, rew_batch,done_batch,info_batch=[],[],[],[]
+
+        for env in self.envs:
+            obs = env._get_image()
+            state = env.client.getMultirotorState(vehicle_name=env.vehicle_name)
+            collided = env.client.simGetCollisionInfo(vehicle_name = env.vehicle_name).has_collided
+
+            
+            current_action =action[i]
+            reward, done, info = env.compute_reward(state, collided, current_action)
+            env.step_count +=1
+            
+            if not done and env.step_count >= env.max_steps:
+                done = True
+                info['time_limit'] = True
+                reward += TIME_LIMIT_PENALTY
+
+            if done:
+                obs = env.reset() # Reset individual env if done
+            
+            obs_batch.append(obs)
+            rew_batch.append(reward)
+            done_batch.append(done)
+            info_batch.append(info)
+
+        return np.stack(obs_batch), np.array(rew_batch), np.array(done_batch), info_batch
+
+
+    
 
 # -----------------------
 # MODEL: CNN Encoder + ActorCritic (Keras)
@@ -277,132 +341,105 @@ def compute_gae(rewards, values, dones, last_value, gamma=GAMMA, lam=LAM):
 # TRAINING LOOP
 # -----------------------
 def train():
-    env = AirSimDroneEnv()
+    env = VectorizedAirSimEnv(num_drones=NUM_DRONES)
     model, log_std = build_actor_critic()
     optimizer = optimizers.Adam(learning_rate=LR)
+    
 
-    # For saving
-    ckpt_prefix = os.path.join(SAVE_DIR, "ppo_ckpt")
-    best_mean_return = -1e9
 
     obs = env.reset()
-    episode_rewards = []
-    ep_ret = 0.0
-    ep_len = 0
+
+    ep_returns = deque(maxlen =10*NUM_DRONES)
+    drone_ep_rets = np.zeros(NUM_DRONES,dtype=np.float32)
 
     for itr in range(1, MAX_TRAIN_ITERS + 1):
         # storage
-        obs_buf = []
-        act_buf = []
-        rew_buf = []
-        val_buf = []
-        logp_buf = []
-        done_buf = []
+        obs_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES,IMG_H,IMG_W,3),dtype=np.float32)
+        act_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES,ACTION_DIM),dtype=np.float32)
+        rew_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES),dtype=np.float32)
+        val_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES),dtype=np.float32)
+        logp_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES),dtype=np.float32)
+        done_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES),dtype=np.float32)
 
         # Collect rollout
         for step in range(ROLLOUT_STEPS):
-            img = obs.astype(np.float32)
-            img_tensor = tf.expand_dims(img, axis=0)  # [1,H,W,3]
-            mu, value = model(img_tensor, training=False)
-            mu = mu[0].numpy()  # shape (action_dim,)
+            
+            mu, value = model(obs, training=False)
             std = np.exp(log_std.numpy())
             # sample action from Gaussian policy
             action = mu + np.random.randn(*mu.shape) * std
             action = np.clip(action, -1.0, 1.0)  # keep in range
             # compute log prob
-            logp = gaussian_log_prob(tf.constant(mu.reshape(1,-1), dtype=tf.float32),
-                                     log_std, tf.constant(action.reshape(1,-1), dtype=tf.float32)).numpy()[0]
+            logp = gaussian_log_prob(mu,log_std,action)
 
             # step the env
-            next_obs, reward, done, info = env.step(action)
-            obs_buf.append(img)
-            act_buf.append(action)
-            rew_buf.append(reward)
-            val_buf.append(value[0][0].numpy())
-            logp_buf.append(logp)
-            done_buf.append(0.0 if done else 1.0)
-
-            ep_ret += reward
-            ep_len += 1
+            next_obs, reward, done, info = env.step(action.numpy())
+            obs_buf[step] = obs
+            act_buf[step] = action.numpy()
+            rew_buf[step] = reward
+            val_buf[step] = tf.squeeze(value).numpy()
+            logp_buf[step] = logp.numpy()
+            done_buf[step] = 1.0-done
 
             obs = next_obs
-            if done:
-                # record and reset
-                episode_rewards.append(ep_ret)
-                print(f"[Itr {itr}] Episode finished. Return: {ep_ret:.2f}, Length: {ep_len}")
-                ep_ret = 0.0
-                ep_len = 0
-                obs = env.reset()
+            drone_ep_rets += reward
+            for i,done in enumerate(done):
+                if done:
+                    ep_returns.append(drone_ep_rets[i])
+                    print(f"[Itr {itr}, Drone {i+1}] Episode finished. Return: {drone_ep_rets[i]:.2f}")
+                    drone_ep_rets[i] = 0
 
-        # bootstrap last value
-        img_tensor = tf.expand_dims(obs.astype(np.float32), axis=0)
-        _, last_val = model(img_tensor, training=False)
-        last_val = float(last_val[0][0].numpy())
-
-        # convert buffers to arrays
-        obs_arr = np.array(obs_buf, dtype=np.float32)
-        acts_arr = np.array(act_buf, dtype=np.float32)
-        rews_arr = np.array(rew_buf, dtype=np.float32)
-        vals_arr = np.array(val_buf, dtype=np.float32)
-        logp_arr = np.array(logp_buf, dtype=np.float32)
-        dones_arr = np.array(done_buf, dtype=np.float32)
-
-        # compute advantages and returns (GAE)
-        advs, returns = compute_gae(rews_arr, vals_arr, dones_arr, last_val, GAMMA, LAM)
-        # normalize advantages
-        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-
-        # Training / update epochs with minibatches
-        dataset_size = len(rews_arr)
+        # Bootstrap last value
+        _, last_val = model(obs, training=False)
+        last_val = tf.squeeze(last_val).numpy()
+        
+        # Reshape buffers for GAE and training
+        # New shape: (num_drones, rollout_steps, ...)
+        obs_buf = np.swapaxes(obs_buf, 0, 1)
+        act_buf = np.swapaxes(act_buf, 0, 1)
+        rew_buf = np.swapaxes(rew_buf, 0, 1)
+        val_buf = np.swapaxes(val_buf, 0, 1)
+        logp_buf = np.swapaxes(logp_buf, 0, 1)
+        done_buf = np.swapaxes(done_buf, 0, 1)
+        
+        advs, returns = compute_gae(rew_buf, val_buf, done_buf, last_val)
+        
+        # Flatten for training
+        obs_flat = obs_buf.reshape(-1, IMG_H, IMG_W, 3)
+        act_flat = act_buf.reshape(-1, ACTION_DIM)
+        logp_flat = logp_buf.reshape(-1)
+        adv_flat = advs.reshape(-1)
+        ret_flat = returns.reshape(-1)
+        
+        # Normalize advantages
+        adv_flat = (adv_flat - np.mean(adv_flat)) / (np.std(adv_flat) + 1e-8)
+        
+        # Training
+        dataset_size = ROLLOUT_STEPS * NUM_DRONES
         inds = np.arange(dataset_size)
         for epoch in range(UPDATE_EPOCHS):
             np.random.shuffle(inds)
             for start in range(0, dataset_size, MINIBATCH_SIZE):
                 mb_inds = inds[start:start+MINIBATCH_SIZE]
-                mb_obs = obs_arr[mb_inds]
-                mb_acts = acts_arr[mb_inds]
-                mb_advs = advs[mb_inds]
-                mb_rets = returns[mb_inds]
-                mb_logp_old = logp_arr[mb_inds]
-
                 with tf.GradientTape() as tape:
-                    mu_batch, val_batch = model(mb_obs, training=True)
-                    # mu_batch: [B, D], val_batch: [B,1]
-                    val_batch = tf.squeeze(val_batch, axis=1)
-                    # broadcast log_std
-                    logp_new = gaussian_log_prob(mu_batch, log_std, tf.constant(mb_acts, dtype=tf.float32))
-                    # policy loss (clipped)
-                    ratio = tf.exp(logp_new - mb_logp_old)
-                    surr1 = ratio * mb_advs
-                    surr2 = tf.clip_by_value(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * mb_advs
+                    mu_batch, val_batch = model(obs_flat[mb_inds], training=True)
+                    val_batch = tf.squeeze(val_batch)
+                    logp_new = gaussian_log_prob(mu_batch, log_std, act_flat[mb_inds])
+                    
+                    ratio = tf.exp(logp_new - logp_flat[mb_inds])
+                    surr1 = ratio * adv_flat[mb_inds]
+                    surr2 = tf.clip_by_value(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_flat[mb_inds]
                     policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
-                    # value loss
-                    value_loss = tf.reduce_mean((mb_rets - val_batch) ** 2)
-                    # entropy bonus
-                    entropy = tf.reduce_mean(0.5 * (tf.math.log(2.0 * np.pi) + 1.0 + 2.0 * log_std))
-                    loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+                    
+                    value_loss = tf.reduce_mean((ret_flat[mb_inds] - val_batch)**2)
+                    loss = policy_loss + 0.5 * value_loss
+                    
+                vars_to_train = model.trainable_variables + [log_std]
+                grads = tape.gradient(loss, vars_to_train)
+                optimizer.apply_gradients(zip(grads, vars_to_train))
 
-                # gather trainable variables: model weights + log_std
-                vars = model.trainable_variables + [log_std]
-                grads = tape.gradient(loss, vars)
-                grads, _ = tf.clip_by_global_norm(grads, 0.5)
-                optimizer.apply_gradients(zip(grads, vars))
-
-        # Logging
-        mean_ret = np.mean(episode_rewards[-10:]) if len(episode_rewards) > 0 else 0.0
-        print(f"[Itr {itr}] Update complete. LastMeanReturn(10): {mean_ret:.2f} | AvgRewardPerStep: {np.mean(rews_arr):.4f}")
-
-        # Save checkpoint occasionally
-        if itr % 10 == 0:
-            # save model weights and log_std
-            model.save_weights(os.path.join(SAVE_DIR, f"model_itr{itr}.h5"))
-            np.save(os.path.join(SAVE_DIR, f"log_std_itr{itr}.npy"), log_std.numpy())
-            print(f"Saved checkpoint at iter {itr}")
-
-        # Early exit if solved-ish (custom criterion)
-        if mean_ret > 50.0 and itr > 50:
-            print("Performance threshold reached -> stopping training.")
-            break
+        mean_ret = np.mean(ep_returns) if ep_returns else 0.0
+        print(f"[Itr {itr}] Update complete. LastMeanReturn: {mean_ret:.2f}")
 
     # cleanup
     model.save_weights(os.path.join(SAVE_DIR, f"model_final.h5"))
