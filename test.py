@@ -52,7 +52,7 @@ GAMMA = 0.99
 LAM = 0.95
 CLIP_EPS = 0.2
 LR = 3e-4
-MAX_TRAIN_ITERS = 1000
+MAX_TRAIN_ITERS = 50
 SAVE_DIR = "ppo_airsim_checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -69,7 +69,7 @@ class AirSimDroneEnv:
         self.prev_dist = None
         self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
         # episode management
-        # self.max_steps = 500  <------------------------------------------->
+        self.max_steps = 500  
         self.step_count = 0
 
         
@@ -226,7 +226,6 @@ class AirSimDroneEnv:
         except:
             pass
 
-
 # -----------------------
 # VECTORIZED ENV WRAPPER (Manages all drones)
 # -----------------------
@@ -251,7 +250,7 @@ class VectorizedAirSimEnv:
             action = actions[i]
             vx = float(np.clip(action[0],-1.0,1.0)*ACTION_SCALE)
             vy = float(np.clip(action[1],-1.0,1.0)*ACTION_SCALE)
-            self.client.moveByVelocityAsync(vx,vy,duration =DT,vehicle_name = env.vehicle_name)
+            self.client.moveByVelocityAsync(vx,vy,0,duration =DT,vehicle_name = env.vehicle_name)
 
         time.sleep(DT)
 
@@ -263,8 +262,8 @@ class VectorizedAirSimEnv:
             collided = env.client.simGetCollisionInfo(vehicle_name = env.vehicle_name).has_collided
 
             
-            current_action =action[i]
-            reward, done, info = env.compute_reward(state, collided, current_action)
+            
+            reward, done, info = env.compute_reward(state, collided, action)
             env.step_count +=1
             
             if not done and env.step_count >= env.max_steps:
@@ -281,9 +280,6 @@ class VectorizedAirSimEnv:
             info_batch.append(info)
 
         return np.stack(obs_batch), np.array(rew_batch), np.array(done_batch), info_batch
-
-
-    
 
 # -----------------------
 # MODEL: CNN Encoder + ActorCritic (Keras)
@@ -317,25 +313,87 @@ def gaussian_log_prob(mu, log_std, actions):
     pre_sum = -0.5 * (((actions - mu) / std) ** 2 + 2.0 * log_std + tf.math.log(2.0 * np.pi))
     return tf.reduce_sum(pre_sum, axis=1)
 
+import numpy as np
+# Assumes NUM_DRONES=N, ROLLOUT_STEPS=T
+
 def compute_gae(rewards, values, dones, last_value, gamma=GAMMA, lam=LAM):
     """
-    rewards: [T]
-    values: [T]
-    dones: [T] (1.0 if not done, 0.0 if done)
-    last_value: scalar
-    returns: advs [T], returns [T]
+    Inputs are assumed to be vectorized: [N, T]
+    rewards: [N, T]
+    values: [N, T]
+    dones: [N, T] (1.0 if NOT done, 0.0 if done)
+    last_value: [N] (vector of the last value estimate for each drone)
+    returns: advs [N, T], returns [N, T]
     """
-    T = len(rewards)
-    advs = np.zeros(T, dtype=np.float32)
-    last_gae = 0.0
+    N, T = rewards.shape  # Correctly identifies N (drones) and T (steps)
+    
+    # 1. Correct Initialization 
+    advs = np.zeros((N, T), dtype=np.float32) 
+    # last_gae is the running total for each drone: [N]
+    last_gae = np.zeros(N, dtype=np.float32)  
+    
+    # 2. Prepare next_values: [N, T] array of V(s_{t+1})
+    # np.hstack joins the V_1 to V_T-1 slice with the last_value [N, 1] vector.
+    # next_values will be (values[:, 1:], last_value[:, None])
+    # The last_value must be reshaped to [N, 1] for hstack
+    next_values = np.hstack([values[:, 1:], last_value[:, None]])
+    
+    # 3. Loop in reverse over time steps T
     for t in reversed(range(T)):
-        mask = dones[t]
-        next_value = last_value if t == T-1 else values[t+1]
-        delta = rewards[t] + gamma * next_value * mask - values[t]
-        last_gae = delta + gamma * lam * mask * last_gae
-        advs[t] = last_gae
+        # All indexing is only on the time dimension 't', resulting in a vector of shape [N]
+        
+        # mask[:, t] is 1.0 if not done, 0.0 if done, for all N drones at time t
+        mask_t = dones[:, t]
+        
+        # delta = R_t + gamma * V_{t+1} * M_t - V_t (Calculated for all N drones)
+        # All components are shape [N]
+        delta = rewards[:, t] + gamma * next_values[:, t] * mask_t - values[:, t]
+        
+        # last_gae = delta + (gamma * lambda) * M_t * old_last_gae (Calculated for all N drones)
+        last_gae = delta + gamma * lam * mask_t * last_gae
+        
+        # Store the calculated advantage for all N drones at time t
+        # advs[:, t] is a slice of size N, matching the shape of last_gae
+        advs[:, t] = last_gae 
+        
     returns = advs + values
     return advs, returns
+
+
+# -----------------------
+# CHECKPOINT HELPERS
+# -----------------------
+def save_checkpoint(model, log_std, optimizer, itr, save_dir):
+    try:
+        opt_weights = optimizer.get_weights()
+    except Exception:
+        opt_weights = None
+
+    checkpoint = {
+        'model_weights': model.get_weights(),
+        'log_std': log_std.numpy(),
+        'optimizer_weights': opt_weights,
+        'iteration': itr
+    }
+    np.save(os.path.join(save_dir, f'checkpoint_itr_{itr}.npy'), checkpoint)
+    print(f"Checkpoint saved at iteration {itr}")
+
+
+def load_checkpoint(model, log_std, optimizer, save_dir):
+    checkpoints = [f for f in os.listdir(save_dir) if f.startswith('checkpoint_itr_')]
+    if not checkpoints:
+        print("ℹNo checkpoints found. Starting fresh.")
+        return 0  # start from iteration 0
+    latest = sorted(checkpoints, key=lambda x: int(x.split('_')[2].split('.')[0]))[-1]
+    checkpoint = np.load(os.path.join(save_dir, latest), allow_pickle=True).item()
+    model.set_weights(checkpoint['model_weights'])
+    log_std.assign(checkpoint['log_std'])
+    if checkpoint['optimizer_weights'] is not None:
+        optimizer.set_weights(checkpoint['optimizer_weights'])
+
+    print(f"Loaded checkpoint from {latest}")
+    return checkpoint['iteration']
+
 
 # -----------------------
 # TRAINING LOOP
@@ -344,15 +402,21 @@ def train():
     env = VectorizedAirSimEnv(num_drones=NUM_DRONES)
     model, log_std = build_actor_critic()
     optimizer = optimizers.Adam(learning_rate=LR)
-    
 
+    
+    _ = optimizer.apply_gradients(zip([tf.zeros_like(var) for var in model.trainable_variables] + [tf.zeros_like(log_std)],model.trainable_variables + [log_std]))
+
+
+    SAVE_DIR = "ppo_airsim_checkpoints"   # make sure this matches your folder
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    start_itr = load_checkpoint(model, log_std, optimizer, SAVE_DIR)
 
     obs = env.reset()
 
     ep_returns = deque(maxlen =10*NUM_DRONES)
     drone_ep_rets = np.zeros(NUM_DRONES,dtype=np.float32)
 
-    for itr in range(1, MAX_TRAIN_ITERS + 1):
+    for itr in range(start_itr + 1, MAX_TRAIN_ITERS + 1):
         # storage
         obs_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES,IMG_H,IMG_W,3),dtype=np.float32)
         act_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES,ACTION_DIM),dtype=np.float32)
@@ -373,9 +437,9 @@ def train():
             logp = gaussian_log_prob(mu,log_std,action)
 
             # step the env
-            next_obs, reward, done, info = env.step(action.numpy())
+            next_obs, reward, done, info = env.step(action)
             obs_buf[step] = obs
-            act_buf[step] = action.numpy()
+            act_buf[step] = action
             rew_buf[step] = reward
             val_buf[step] = tf.squeeze(value).numpy()
             logp_buf[step] = logp.numpy()
@@ -441,11 +505,17 @@ def train():
         mean_ret = np.mean(ep_returns) if ep_returns else 0.0
         print(f"[Itr {itr}] Update complete. LastMeanReturn: {mean_ret:.2f}")
 
+        # ---------------------------
+        # SAVE CHECKPOINT
+        # ---------------------------
+        save_checkpoint(model, log_std, optimizer, itr, SAVE_DIR)
+
     # cleanup
-    model.save_weights(os.path.join(SAVE_DIR, f"model_final.h5"))
+    model.save_weights(os.path.join(SAVE_DIR, "model_final.weights.h5"))
     np.save(os.path.join(SAVE_DIR, f"log_std_final.npy"), log_std.numpy())
-    env.close()
     print("Training finished and model saved.")
+
+    # env.close()                                    <------------------------------------------------------------------------->
 
 if __name__ == "__main__":
     train()
