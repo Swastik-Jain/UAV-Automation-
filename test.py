@@ -12,9 +12,30 @@ import numpy as np
 import cv2
 import airsim
 import tensorflow as tf
-from keras import layers, models, optimizers
+from tensorflow.keras import layers, models, optimizers
 from collections import deque
 
+import argparse
+import shutil
+from tensorflow.keras.models import load_model
+import matplotlib.pyplot as plt
+
+
+# Enable GPU memory growth for smoother training
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(" GPU memory growth enabled.")
+    except RuntimeError as e:
+        print(" GPU memory growth config error:", e)
+
+
+
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(4)
+ 
 # -----------------------
 # CONFIG
 # -----------------------
@@ -29,30 +50,33 @@ NUM_DRONES = 3
 # --- Environment ---
 IMG_H, IMG_W = 84, 84
 ACTION_DIM = 2
-ACTION_SCALE = 3.0
+ACTION_SCALE = 1.5
 DT = 0.3
 
 MIN_DIST_TO_GOAL = 5.0
 GOAL_RADIUS = 2.0
 
 # --- Reward Coefficients ---
-GOAL_REWARD = 5.0
-COLLISION_PENALTY = -5.0
-TIME_LIMIT_PENALTY = -1.0
-TIME_PENALTY = -0.01
-PROGRESS_COEFF = 2.5
-ALIGNMENT_COEFF = 0.1
-SMOOTHNESS_PENALTY_WEIGHT = 0.01
+GOAL_REWARD = 100.0
+COLLISION_PENALTY = -100.0
+TIME_LIMIT_PENALTY = 100
+TIME_PENALTY = 0.1
+PROGRESS_COEFF = 3.0
+ALIGNMENT_COEFF = 1.0
+SMOOTHNESS_PENALTY_WEIGHT = 0.2
+
 
 # --- PPO Hyperparameters ---
-ROLLOUT_STEPS = 512           # Steps per agent per update
+ROLLOUT_STEPS = 2048      # Steps per agent per update
 MINIBATCH_SIZE = 64 * NUM_DRONES
-UPDATE_EPOCHS = 8
-GAMMA = 0.99
-LAM = 0.95
-CLIP_EPS = 0.2
-LR = 3e-4
-MAX_TRAIN_ITERS = 50
+UPDATE_EPOCHS = 10
+GAMMA = 0.995
+LAM = 0.97
+CLIP_EPS = 0.15
+LR = 1e-4
+ENTROPY_COEFF = 0.01   # try 0.005–0.02 range
+
+MAX_TRAIN_ITERS = 80
 SAVE_DIR = "ppo_airsim_checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -109,7 +133,7 @@ class AirSimDroneEnv:
         quat = airsim.to_quaternion(0,0,0)
         pose = airsim.Pose(airsim.Vector3r(x,y,z),quat)
         self.client.simSetVehiclePose(pose,ignore_collision=True,vehicle_name=self.vehicle_name)
-
+        
         self.goal=np.array([gx,gy,gz],dtype=np.float32)
         self.prev_action = np.zeros(ACTION_DIM,dtype=np.float32)
         self.step_count = 0
@@ -131,6 +155,7 @@ class AirSimDroneEnv:
             state_now.kinematics_estimated.position.z_val
         ], dtype=np.float32)
         self.prev_dist = np.linalg.norm((pos_now[:2] - self.goal[:2]))
+        self.initial_dist = self.prev_dist
         
         return self._get_image()
 
@@ -148,9 +173,12 @@ class AirSimDroneEnv:
             self.prev_dist = dist
         progress = self.prev_dist - dist
         
+        progress_norm = progress/(self.initial_dist + 1e-6)
+
         if dist < GOAL_RADIUS:  #goal reached
             print("Goal reached")
-            return GOAL_REWARD,True,{'goal_reached':True}
+            bonus = max(0, (self.max_steps - self.step_count) * 0.01)  # early finish bonus
+            return GOAL_REWARD + bonus,True,{'goal_reached':True}
         
         if collided: #collided 
             print("Collided")
@@ -158,10 +186,14 @@ class AirSimDroneEnv:
         
         reward = 0.0
         # per-step time penalty to encourage faster completion
-        reward -= TIME_PENALTY
+        progress_fraction = 1.0 - (dist / (self.initial_dist + 1e-6))
+        # Gradually increase time penalty as the episode goes on
+        time_penalty_scaled = TIME_PENALTY * (0.5 + progress_fraction)  # 0.5x to 1.5x
+        reward -= time_penalty_scaled
 
         # progress toward goal in horizontal plane
-        reward += PROGRESS_COEFF * progress
+        adaptive_coeff = PROGRESS_COEFF * (1.0+0.5*(1.0-dist/self.initial_dist))
+        reward += adaptive_coeff * progress_norm
 
         # encourage velocity alignment toward goal direction (horizontal)
         dir_vec = goal_xy - pos_xy
@@ -184,6 +216,13 @@ class AirSimDroneEnv:
             
         self.prev_action = action
         self.prev_dist = dist
+        # Penalize very low progress (stuck or zig-zag)
+        if abs(progress) < 0.01:
+            reward -= 0.02
+
+        if not collided and dist >= GOAL_RADIUS:
+            reward = np.clip(reward / 10.0, -1.0, 1.0)
+
         return reward,False,{'collision' :False }
         
     def step(self,action):
@@ -256,20 +295,21 @@ class VectorizedAirSimEnv:
 
         obs_batch, rew_batch,done_batch,info_batch=[],[],[],[]
 
-        for env in self.envs:
+        for i, env in enumerate(self.envs):
             obs = env._get_image()
             state = env.client.getMultirotorState(vehicle_name=env.vehicle_name)
-            collided = env.client.simGetCollisionInfo(vehicle_name = env.vehicle_name).has_collided
+            collided = env.client.simGetCollisionInfo(vehicle_name=env.vehicle_name).has_collided
 
             
-            
-            reward, done, info = env.compute_reward(state, collided, action)
+            # use each drone’s corresponding action
+            action_i = actions[i]
+            reward, done, info = env.compute_reward(state, collided, action_i)
             env.step_count +=1
             
             if not done and env.step_count >= env.max_steps:
                 done = True
                 info['time_limit'] = True
-                reward += TIME_LIMIT_PENALTY
+                reward -= TIME_LIMIT_PENALTY
 
             if done:
                 obs = env.reset() # Reset individual env if done
@@ -378,45 +418,92 @@ def save_checkpoint(model, log_std, optimizer, itr, save_dir):
     np.save(os.path.join(save_dir, f'checkpoint_itr_{itr}.npy'), checkpoint)
     print(f"Checkpoint saved at iteration {itr}")
 
+def save_full_model(model, log_std, save_dir, tag="final", itr=None):
+    os.makedirs(save_dir, exist_ok=True)
+    fname = f"model_final.h5" if tag == "final" else f"model_itr_{itr}.h5"
+    model.save(os.path.join(save_dir, fname), save_format="h5")
+    np.save(os.path.join(save_dir, f"log_std_{tag}.npy"), log_std.numpy())
+    print(f"Full model saved: {fname} and log_std_{tag}.npy")
 
-def load_checkpoint(model, log_std, optimizer, save_dir):
+
+
+def load_checkpoint(model, log_std, optimizer, save_dir, force_start=False):
+    """
+    If force_start=True -> do NOT load any checkpoint (start fresh, return 0).
+    Otherwise try to load latest 'checkpoint_itr_*.npy' and restore model/log_std/optimizer.
+    """
+    if force_start:
+         print("🔁 force_start=True -> Starting fresh (no checkpoint loaded).")
+         return 0
+    
     checkpoints = [f for f in os.listdir(save_dir) if f.startswith('checkpoint_itr_')]
-    if not checkpoints:
-        print("ℹNo checkpoints found. Starting fresh.")
-        return 0  # start from iteration 0
-    latest = sorted(checkpoints, key=lambda x: int(x.split('_')[2].split('.')[0]))[-1]
-    checkpoint = np.load(os.path.join(save_dir, latest), allow_pickle=True).item()
-    model.set_weights(checkpoint['model_weights'])
-    log_std.assign(checkpoint['log_std'])
-    if checkpoint['optimizer_weights'] is not None:
-        optimizer.set_weights(checkpoint['optimizer_weights'])
+    if checkpoints:
+        latest = sorted(checkpoints, key=lambda x: int(x.split('_')[2].split('.')[0]))[-1]
+        checkpoint = np.load(os.path.join(save_dir, latest), allow_pickle=True).item()
+        model.set_weights(checkpoint['model_weights'])
+        log_std.assign(checkpoint['log_std'])
+        if checkpoint['optimizer_weights'] is not None:
+            try:
+                optimizer.set_weights(checkpoint['optimizer_weights'])
+            except Exception as e:
+                print(" Could not restore optimizer state:", e)
+        print(f"Loaded checkpoint from {latest}")
+        return checkpoint.get('iteration',0)
+        
+    model_path = os.path.join(save_dir, "model_final.h5")
+    logstd_path = os.path.join(save_dir, "log_std_final.npy")
+    if os.path.exists(model_path):
+        try:
+            tmp = load_model(model_path, compile=False)
+            model.set_weights(tmp.get_weights())
+            print("Loaded model_final.h5 weights into current model architecture.")
+            if os.path.exists(logstd_path):
+                log_std.assign(np.load(logstd_path))
+                return 0
+        except Exception as e:
+            print(" Failed to load model_final.h5 fallback:", e)
 
-    print(f"Loaded checkpoint from {latest}")
-    return checkpoint['iteration']
-
-
+    print("ℹ No checkpoints found. Starting fresh.")
+    return 0
+    
 # -----------------------
 # TRAINING LOOP
 # -----------------------
 def train():
-    env = VectorizedAirSimEnv(num_drones=NUM_DRONES)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fresh", action="store_true", help="Start training fresh (ignore checkpoints)")
+    parser.add_argument("--save-full-every", type=int, default=10, help="Save full model every N iterations")
+    args, unknown = parser.parse_known_args()
+
+    SAVE_FULL_EVERY = args.save_full_every
     model, log_std = build_actor_critic()
-    optimizer = optimizers.Adam(learning_rate=LR)
+    optimizer = optimizers.Adam(learning_rate=3e-4)  
 
-    
+    # initialize optimizer variables
+
+    env = VectorizedAirSimEnv(num_drones=NUM_DRONES)
     _ = optimizer.apply_gradients(zip([tf.zeros_like(var) for var in model.trainable_variables] + [tf.zeros_like(log_std)],model.trainable_variables + [log_std]))
-
-
-    SAVE_DIR = "ppo_airsim_checkpoints"   # make sure this matches your folder
+        
+    SAVE_DIR = "ppo_airsim_checkpoints"
     os.makedirs(SAVE_DIR, exist_ok=True)
-    start_itr = load_checkpoint(model, log_std, optimizer, SAVE_DIR)
+
+    start_itr = load_checkpoint(model, log_std, optimizer, SAVE_DIR, force_start=args.fresh)
+    print(f"Training starting from iteration {start_itr + 1}")
 
     obs = env.reset()
 
     ep_returns = deque(maxlen =10*NUM_DRONES)
     drone_ep_rets = np.zeros(NUM_DRONES,dtype=np.float32)
 
+    # Track metrics for plotting and saving
+    iters = []
+    mean_returns = []
+    success_rates = []
+    episodes_per_iter = []
+
+
     for itr in range(start_itr + 1, MAX_TRAIN_ITERS + 1):
+        true_goal_successes = 0
         # storage
         obs_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES,IMG_H,IMG_W,3),dtype=np.float32)
         act_buf = np.zeros((ROLLOUT_STEPS,NUM_DRONES,ACTION_DIM),dtype=np.float32)
@@ -447,11 +534,18 @@ def train():
 
             obs = next_obs
             drone_ep_rets += reward
-            for i,done in enumerate(done):
-                if done:
+            for i, done_flag in enumerate(done):
+                if done_flag:
                     ep_returns.append(drone_ep_rets[i])
+                    # Check if the current drone reached the goal
+                    if isinstance(info, list) and i < len(info):
+                        if info[i].get('goal_reached', False):
+                            print(f"Drone {i+1} reached the goal!")
+                            true_goal_successes += 1
                     print(f"[Itr {itr}, Drone {i+1}] Episode finished. Return: {drone_ep_rets[i]:.2f}")
                     drone_ep_rets[i] = 0
+
+            last_info_batch = info
 
         # Bootstrap last value
         _, last_val = model(obs, training=False)
@@ -467,7 +561,9 @@ def train():
         done_buf = np.swapaxes(done_buf, 0, 1)
         
         advs, returns = compute_gae(rew_buf, val_buf, done_buf, last_val)
-        
+        # Normalize rewards across all drones and rollout steps
+        # rew_buf = (rew_buf - np.mean(rew_buf)) / (np.std(rew_buf) + 1e-8)
+ 
         # Flatten for training
         obs_flat = obs_buf.reshape(-1, IMG_H, IMG_W, 3)
         act_flat = act_buf.reshape(-1, ACTION_DIM)
@@ -496,24 +592,68 @@ def train():
                     policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
                     
                     value_loss = tf.reduce_mean((ret_flat[mb_inds] - val_batch)**2)
-                    loss = policy_loss + 0.5 * value_loss
+                    # --- Entropy bonus for exploration ---
+                    std = tf.exp(log_std)
+                    entropy = tf.reduce_mean(0.5 * tf.math.log(2.0 * np.pi * np.e * std ** 2))
+                    entropy_loss = -ENTROPY_COEFF * entropy
+
+
+                    loss = policy_loss + 0.5 * value_loss + entropy_loss
                     
                 vars_to_train = model.trainable_variables + [log_std]
                 grads = tape.gradient(loss, vars_to_train)
                 optimizer.apply_gradients(zip(grads, vars_to_train))
 
         mean_ret = np.mean(ep_returns) if ep_returns else 0.0
-        print(f"[Itr {itr}] Update complete. LastMeanReturn: {mean_ret:.2f}")
+            
+        total_episodes = len(ep_returns)  
+        success_rate = (true_goal_successes / total_episodes) * 100 if total_episodes > 0 else 0.0
+
+        print(f"[Itr {itr}] Success Rate (true goals): {success_rate:.2f}% | Mean Return: {mean_ret:.2f}")
+
+        # save metrics for post-training plotting
+        iters.append(itr)
+        mean_returns.append(mean_ret)
+        success_rates.append(success_rate)
+        episodes_per_iter.append(len(ep_returns))
+        
 
         # ---------------------------
         # SAVE CHECKPOINT
         # ---------------------------
         save_checkpoint(model, log_std, optimizer, itr, SAVE_DIR)
 
+        # Save full model every few iterations
+        if itr % SAVE_FULL_EVERY == 0:
+            save_full_model(model, log_std, SAVE_DIR, tag=f"itr_{itr}", itr=itr)
+            
+
+
     # cleanup
-    model.save_weights(os.path.join(SAVE_DIR, "model_final.weights.h5"))
-    np.save(os.path.join(SAVE_DIR, f"log_std_final.npy"), log_std.numpy())
-    print("Training finished and model saved.")
+    save_full_model(model, log_std, SAVE_DIR, tag="final")
+    save_checkpoint(model, log_std, optimizer, itr, SAVE_DIR)
+
+    # ---- Simple Training Performance Plot ----
+    plt.figure(figsize=(8, 5))
+    plt.plot(iters, mean_returns, label='Mean Return', marker='o')
+    plt.title("Drone Training Progress (Mean Return)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Mean Return")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(iters, success_rates, label='Success Rate (%)', color='green', marker='o')
+    plt.title("Drone Training Progress (Success Rate)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Success Rate (%)")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+    
+
+    print("Training finished and model saved successfully.")
 
     # env.close()                                    <------------------------------------------------------------------------->
 
