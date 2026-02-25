@@ -1,0 +1,51 @@
+--- PPO Tensor Shape Analysis ---
+
+## 1. Model Input/Output Shapes
+Model Input (obs_batch)   | Shape: (3, 84, 84, 3)
+Model Output (mu)         | Shape: (3, 2)
+Model Output (value)      | Shape: (3, 1)
+Trainable (log_std)       | Shape: (2,)
+
+========================================
+
+## 2. Rollout Buffer Shapes (Before GAE)
+These buffers store data for all drones over all rollout steps.
+Observation Buffer        | Shape: (512, 3, 84, 84, 3)
+Action Buffer             | Shape: (512, 3, 2)
+Reward Buffer             | Shape: (512, 3)
+Value Buffer              | Shape: (512, 3)
+Log Probability Buffer    | Shape: (512, 3)
+Done Buffer               | Shape: (512, 3)
+Last Value (bootstrap)    | Shape: (3,)
+
+========================================
+
+## 3. GAE Calculation Shapes
+Data is reshaped to (NUM_DRONES, ROLLOUT_STEPS) for parallel GAE calculation.
+Reward Buffer (for GAE)   | Shape: (3, 512)
+Value Buffer (for GAE)    | Shape: (3, 512)
+Done Buffer (for GAE)     | Shape: (3, 512)
+Advantages (GAE Output)   | Shape: (3, 512)
+Returns (GAE Output)      | Shape: (3, 512)
+
+========================================
+
+## 4. Training Batch Shapes (Flattened)
+All data is flattened into one large batch for shuffling and training.
+Flattened Observations    | Shape: (1536, 84, 84, 3)
+Flattened Actions         | Shape: (1536, 2)
+Flattened Log Probs       | Shape: (1536,)
+Flattened Advantages      | Shape: (1536,)
+Flattened Returns         | Shape: (1536,)
+
+========================================
+
+## 5. Minibatch Shapes (Inside the update loop)
+The flattened data is sampled into minibatches for gradient updates.
+Minibatch Observations    | Shape: (192, 84, 84, 3)
+Minibatch Actions         | Shape: (192, 2)
+Minibatch Log Probs       | Shape: (192,)
+Minibatch Advantages      | Shape: (192,)
+Minibatch Returns         | Shape: (192,)
+Model Mu (in update)      | Shape: (192, 2)
+Model Value (in update)   | Shape: (192,)

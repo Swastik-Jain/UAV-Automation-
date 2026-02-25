@@ -1,0 +1,62 @@
+.App {
+    text-align: center;
+  }
+  
+  .App-header {
+    background-color: #282c34;
+    padding: 20px;
+    color: white;
+  }
+  
+  .main-container {
+    display: flex;
+    flex-direction: row;
+    padding: 20px;
+    gap: 20px;
+  }
+  
+  .visuals-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  
+  .controls-container {
+    border-left: 2px solid #ccc;
+    padding-left: 20px;
+    text-align: left;
+  }
+  
+  .live-feed-container img {
+    width: 500px;
+    height: 281px; /* 16:9 aspect ratio */
+    border: 1px solid black;
+  }
+  
+  .live-feed-container .placeholder {
+      width: 500px;
+      height: 281px;
+      border: 1px solid rgb(141, 53, 53);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background-color: #333;
+      color: white;
+  }
+  
+  canvas {
+    border: 1px solid rgb(0, 0, 0);
+    cursor: pointer;
+  }
+  
+  button {
+    margin-top: 20px;
+    padding: 10px 20px;
+    font-size: 16px;
+    cursor: pointer;
+  }
+  
+  button:disabled {
+    cursor: not-allowed;
+    background-color: #ccc;
+  }

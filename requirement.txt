@@ -1,0 +1,9 @@
+numpy<2.0.0
+msgpack-rpc-python
+airsim
+opencv-python==4.8.0.76
+matplotlib
+tensorflow-macos
+tensorflow-metal
+fastapi
+uvicorn
