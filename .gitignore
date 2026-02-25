@@ -15,23 +15,13 @@ dist-ssr
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
-.idea/
+.idea
 .DS_Store
-.AppleDouble
-.LSOverride
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-*.swp
-*.swo
-*~
-
-# Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
 
 # Python
 env/
@@ -39,14 +29,33 @@ __pycache__/
 *.pyc
 *.pyo
 
-# AirSim specific
-*.bin
-*.pak
-
 # Model checkpoints & weights (large binary files)
 ppo_airsim_checkpoints/
 *.h5
 *.npy
+
+<<<<<<< Updated upstream
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# AirSim specific
+*.log
+*.txt
+*.bin
+*.pak
 
 # Environment variables
 .env
@@ -55,10 +64,18 @@ ppo_airsim_checkpoints/
 .env.test.local
 .env.production.local
 
+# IDE
+*.swp
+*.swo
+*~
+
 # Temporary files
 *.tmp
 *.temp
 
+.test2.py
+=======
 # Large documents
 *.pdf
 *.docx
+>>>>>>> Stashed changes
