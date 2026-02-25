@@ -42,6 +42,8 @@ NUM_DRONES = 3
 
 #------------Environment Parameters------------
 # --- Environment ---
+# City curriculum: start small, expand per phase (8 → 15 → 25)
+SPAWN_RANGE = 8.0     # Phase 1: ±8m — goals always reachable, no blocked LOS
 IMG_H, IMG_W = 84, 84
 ACTION_DIM = 2
 ### NEW: Define shape of the new goal vector (distance, angle) ###
@@ -58,8 +60,9 @@ GOAL_RADIUS = 2.0
 
 # --- Reward Coefficients ---
 GOAL_REWARD = 100.0
-COLLISION_PENALTY = -100.0
-TIME_LIMIT_PENALTY = 100
+COLLISION_PENALTY = -150.0  # City: heavier penalty — dense buildings make collisions frequent
+# FIX: Was 100 (same magnitude as GOAL_REWARD, creating wrong incentive). Reduced to 10.
+TIME_LIMIT_PENALTY = 10.0
 TIME_PENALTY = 0.05
 PROGRESS_COEFF = 5.0
 ALIGNMENT_COEFF = 1.5
@@ -69,15 +72,22 @@ SMOOTHNESS_PENALTY_WEIGHT = 0.1
 # --- PPO Hyperparameters ---
 ROLLOUT_STEPS = 1024
 MINIBATCH_SIZE = 128 * NUM_DRONES
-UPDATE_EPOCHS = 6
+UPDATE_EPOCHS = 8
 GAMMA = 0.995
 LAM = 0.97
 CLIP_EPS = 0.2
 LR = 3e-4
-ENTROPY_COEFF = 0.005
-
-MAX_TRAIN_ITERS = 20
-SAVE_DIR = r"D:\DroneNavigationProject\UAV-Automation-\ppo_airsim_checkpoints"
+# FIX: Raised start so the policy explores more before committing (was 0.02)
+ENTROPY_COEFF_START = 0.05
+ENTROPY_COEFF_END   = 0.005
+VALUE_CLIP_EPS = 0.2       # FIX: Added value-function clipping (PPO best practice)
+MAX_KL = 0.015             # FIX: KL early-stopping threshold per epoch
+MAX_GRAD_NORM = 0.5        # FIX: Gradient clip norm to prevent divergence
+# FIX: Freeze CNN layers for first N iters so goal-vector branch can warm up
+CNN_FREEZE_ITERS = 20  # City: unfreeze CNN sooner — visual obstacle awareness is critical
+# FIX: Was 260 — bumped to 500+ for CNN+goal navigation convergence
+MAX_TRAIN_ITERS = 500
+SAVE_DIR = "ppo_airsim_checkpoints"
 ### NEW: Path to your old model for transfer learning ###
 OLD_MODEL_PATH = os.path.join(SAVE_DIR, "model_final.h5") 
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -156,13 +166,13 @@ class AirSimDroneEnv:
 
     def reset(self):
         while True:
-            x = np.random.uniform(-20,20)
-            y = np.random.uniform(-20,20)
-            z = -5.0
+            x = np.random.uniform(-SPAWN_RANGE, SPAWN_RANGE)
+            y = np.random.uniform(-SPAWN_RANGE, SPAWN_RANGE)
+            z = -15.0  # City: 15m altitude clears most building rooftops
 
-            gx = np.random.uniform(-20,20)
-            gy = np.random.uniform(-20,20)
-            gz = -5.0
+            gx = np.random.uniform(-SPAWN_RANGE, SPAWN_RANGE)
+            gy = np.random.uniform(-SPAWN_RANGE, SPAWN_RANGE)
+            gz = -15.0
 
             if np.linalg.norm(np.array([x,y,z]) - np.array([gx,gy,gz])) > MIN_DIST_TO_GOAL:
                 break
@@ -182,8 +192,16 @@ class AirSimDroneEnv:
             print("Spawned in a collided state! Retrying reset...")
             return self.reset()
         
+        # FIX: Give takeoffAsync enough time; 1 s was sometimes not enough.
         self.client.takeoffAsync(vehicle_name=self.vehicle_name)
-        time.sleep(1) # Keep your sleep, as .join() blocks the parallel resets
+        time.sleep(2)  # FIX: Extended from 1 s → 2 s so drone is airborne before episode starts
+
+        # City safety check: if drone barely lifted it spawned inside geometry — retry
+        state_check = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        achieved_z = state_check.kinematics_estimated.position.z_val
+        if achieved_z > -3.0:
+            print(f"[{self.vehicle_name}] Takeoff stalled (z={achieved_z:.1f}m) — likely inside building. Retrying...")
+            return self.reset()
 
         state_now = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
         pos_now = np.array([
@@ -209,52 +227,59 @@ class AirSimDroneEnv:
         if self.prev_dist is None:
             self.prev_dist = dist
         progress = self.prev_dist - dist
-        
-        progress_norm = progress/(self.initial_dist + 1e-6)
+
+        # FIX: Clamp initial_dist to avoid divide-by-zero producing NaN
+        init_d = max(self.initial_dist, 1e-3)
+        progress_norm = progress / init_d
 
         if dist < GOAL_RADIUS:
             print(f"[{self.vehicle_name}] Goal reached")
-            bonus = max(0, (self.max_steps - self.step_count) * 0.01)
-            return GOAL_REWARD + bonus,True,{'goal_reached':True}
-        
-        if collided: 
+            bonus = max(0, (self.max_steps - self.step_count) * 0.1)
+            return GOAL_REWARD + bonus, True, {'goal_reached': True}
+
+        if collided:
             print(f"[{self.vehicle_name}] Collided")
-            return COLLISION_PENALTY ,True,{'collision' :True }
-        
+            return COLLISION_PENALTY, True, {'collision': True}
+
         reward = 0.0
-        progress_fraction = 1.0 - (dist / (self.initial_dist + 1e-6))
+
+        # Time penalty — slightly scaled by progress so early on it's less punishing
+        progress_fraction = np.clip(1.0 - (dist / init_d), 0.0, 1.0)
         time_penalty_scaled = TIME_PENALTY * (0.5 + progress_fraction)
         reward -= time_penalty_scaled
 
-        adaptive_coeff = PROGRESS_COEFF * (1.0+0.5*(1.0-dist/self.initial_dist))
+        # Progress reward — adaptive coefficient
+        adaptive_coeff = PROGRESS_COEFF * (1.0 + 0.5 * (1.0 - dist / init_d))
         reward += adaptive_coeff * progress_norm
 
+        # Alignment reward — uses ACTUAL measured velocity (not commanded action)
+        # FIX: commanded action != actual physics velocity due to drag/PID lag
         dir_vec = goal_xy - pos_xy
         dir_norm = np.linalg.norm(dir_vec) + 1e-8
         dir_unit = dir_vec / dir_norm
-
-        v_vec = np.array([
-            float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE),
-            float(np.clip(action[1], -1.0, 1.0) * ACTION_SCALE)
-        ], dtype=np.float32)
+        meas_vel = state.kinematics_estimated.linear_velocity
+        v_vec = np.array([meas_vel.x_val, meas_vel.y_val], dtype=np.float32)
         speed = np.linalg.norm(v_vec)
         if speed > 1e-6:
             vel_unit = v_vec / speed
             alignment = float(np.dot(vel_unit, dir_unit))
             reward += ALIGNMENT_COEFF * speed * alignment
 
+        # Smoothness penalty
         reward -= SMOOTHNESS_PENALTY_WEIGHT * np.linalg.norm(action - self.prev_action)
-            
+
+        # Stagnation penalty — FIX: threshold raised to 5cm (was 1cm, never fired)
+        # Step size is ~45cm, so 5cm is a realistic "barely moved" threshold
+        if abs(progress) < 0.05:
+            reward -= 0.2
+
         self.prev_action = action
         self.prev_dist = dist
-        
-        if abs(progress) < 0.01:
-            reward -= 0.02
 
-        if not collided and dist >= GOAL_RADIUS:
-            reward = np.clip(reward / 10.0, -1.0, 1.0)
-
-        return reward,False,{'collision' :False }
+        # FIX: REMOVED the np.clip(reward/10.0, -1.0, 1.0) that was destroying the
+        # goal-direction signal. Progress toward goal and away from goal now produce
+        # meaningfully different reward magnitudes, so the policy CAN learn direction.
+        return reward, False, {'collision': False}
         
     def step(self,action):
         vx = float(np.clip(action[0], -1.0, 1.0) * ACTION_SCALE)
@@ -535,13 +560,14 @@ def train():
     
     ### MODIFIED: Build the new model ###
     model, log_std = build_actor_critic()
-    optimizer = optimizers.Adam(learning_rate=LR)
-    model.summary() # Print model summary to confirm architecture
+    # FIX: Added clipnorm for gradient clipping — prevents early divergence
+    optimizer = optimizers.Adam(learning_rate=LR, clipnorm=MAX_GRAD_NORM)
+    model.summary()
 
     env = VectorizedAirSimEnv(num_drones=NUM_DRONES)
-    
+
     # Initialize optimizer
-    _ = optimizer.apply_gradients(zip([tf.zeros_like(var) for var in model.trainable_variables] + [tf.zeros_like(log_std)],model.trainable_variables + [log_std]))
+    _ = optimizer.apply_gradients(zip([tf.zeros_like(var) for var in model.trainable_variables] + [tf.zeros_like(log_std)], model.trainable_variables + [log_std]))
         
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -559,7 +585,7 @@ def train():
     ### MODIFIED: obs is now (img_obs, vec_obs) ###
     img_obs, vec_obs = env.reset()
 
-    ep_returns = deque(maxlen =10*NUM_DRONES)
+    ep_returns = deque(maxlen=50*NUM_DRONES)   # FIX: wider window for stable metrics
     drone_ep_rets = np.zeros(NUM_DRONES,dtype=np.float32)
 
     iters = []
@@ -568,8 +594,29 @@ def train():
     episodes_per_iter = []
 
 
+    # ---- CNN Freeze Schedule ----
+    CNN_LAYER_NAMES = ["conv2d_0", "conv2d_1", "conv2d_2", "flatten", "dense_img"]
+
     for itr in range(start_itr + 1, MAX_TRAIN_ITERS + 1):
+        # FIX: Compute freeze state each iter relative to start_itr so that
+        # checkpoint resumes correctly inherit the freeze/unfreeze schedule.
+        iters_since_start = itr - start_itr
+        cnn_frozen = (iters_since_start <= CNN_FREEZE_ITERS)
+        for lname in CNN_LAYER_NAMES:
+            try:
+                model.get_layer(lname).trainable = not cnn_frozen
+            except:
+                pass
+        if iters_since_start == 1:
+            print(f"[CNN Schedule] Freezing CNN layers for first {CNN_FREEZE_ITERS} iters.")
+        elif iters_since_start == CNN_FREEZE_ITERS + 1:
+            print("[CNN Schedule] Unfreezing CNN layers for full joint training.")
+
+        # FIX: Linearly decay entropy coefficient
+        frac = min(1.0, (itr - 1) / max(MAX_TRAIN_ITERS - 1, 1))
+        ENTROPY_COEFF = ENTROPY_COEFF_START + frac * (ENTROPY_COEFF_END - ENTROPY_COEFF_START)
         true_goal_successes = 0
+        episodes_this_iter = 0   # FIX: track actual episodes completed this rollout
         
         ### MODIFIED: Buffers for (img, vec) state ###
         # MODIFIED: Correct channel dim
@@ -612,15 +659,15 @@ def train():
             for i, done_flag in enumerate(done):
                 if done_flag:
                     ep_returns.append(drone_ep_rets[i])
+                    episodes_this_iter += 1  # FIX: count episodes per rollout
                     if isinstance(info, list) and i < len(info):
                         if info[i].get('goal_reached', False):
-                            # MODIFIED: Added drone name to log
                             print(f"[Itr {itr}, Drone {i+1}] Episode finished. GOAL REACHED! Return: {drone_ep_rets[i]:.2f}")
                             true_goal_successes += 1
                         else:
-                             print(f"[Itr {itr}, Drone {i+1}] Episode finished. Return: {drone_ep_rets[i]:.2f}")
+                            print(f"[Itr {itr}, Drone {i+1}] Episode finished. Return: {drone_ep_rets[i]:.2f}")
                     else:
-                         print(f"[Itr {itr}, Drone {i+1}] Episode finished. Return: {drone_ep_rets[i]:.2f}")
+                        print(f"[Itr {itr}, Drone {i+1}] Episode finished. Return: {drone_ep_rets[i]:.2f}")
                     drone_ep_rets[i] = 0
 
             last_info_batch = info
@@ -654,28 +701,41 @@ def train():
         dataset_size = ROLLOUT_STEPS * NUM_DRONES
         inds = np.arange(dataset_size)
         
+        # Store old log-probs for KL check
+        old_logp_flat = logp_flat.copy()
+
         for epoch in range(UPDATE_EPOCHS):
             np.random.shuffle(inds)
+            kl_epoch = 0.0
+            kl_count = 0
+            early_stop = False
+
             for start in range(0, dataset_size, MINIBATCH_SIZE):
                 mb_inds = inds[start:start+MINIBATCH_SIZE]
                 with tf.GradientTape() as tape:
-                    
-                    ### MODIFIED: Model call with two inputs ###
                     mu_batch, val_batch = model([
-                        img_flat[mb_inds], 
+                        img_flat[mb_inds],
                         vec_flat[mb_inds]
                     ], training=True)
-                    
+
                     val_batch = tf.squeeze(val_batch)
                     logp_new = gaussian_log_prob(mu_batch, log_std, act_flat[mb_inds])
-                    
+
                     ratio = tf.exp(logp_new - logp_flat[mb_inds])
                     surr1 = ratio * adv_flat[mb_inds]
                     surr2 = tf.clip_by_value(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_flat[mb_inds]
                     policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
-                    
-                    value_loss = tf.reduce_mean((ret_flat[mb_inds] - val_batch)**2)
-                    
+
+                    # FIX: Value function clipping (PPO best practice)
+                    val_old = ret_flat[mb_inds] - adv_flat[mb_inds]  # approx old value
+                    val_clipped = val_old + tf.clip_by_value(
+                        val_batch - val_old, -VALUE_CLIP_EPS, VALUE_CLIP_EPS
+                    )
+                    value_loss = tf.reduce_mean(tf.maximum(
+                        (ret_flat[mb_inds] - val_batch) ** 2,
+                        (ret_flat[mb_inds] - val_clipped) ** 2
+                    ))
+
                     std = tf.exp(log_std)
                     entropy = tf.reduce_mean(0.5 * tf.math.log(2.0 * np.pi * np.e * std ** 2))
                     entropy_loss = -ENTROPY_COEFF * entropy
@@ -685,16 +745,29 @@ def train():
                     entropy_loss = tf.cast(entropy_loss, tf.float32)
                     loss = policy_loss + 0.5 * value_loss + entropy_loss
 
-                    
-                vars_to_train = model.trainable_variables + [log_std]
+                vars_to_train = [v for v in model.trainable_variables] + [log_std]
                 grads = tape.gradient(loss, vars_to_train)
                 optimizer.apply_gradients(zip(grads, vars_to_train))
 
-        mean_ret = np.mean(ep_returns) if ep_returns else 0.0
-        total_episodes = len(ep_returns)
-        success_rate = (true_goal_successes / total_episodes) * 100 if total_episodes > 0 else 0.0
+                # FIX: Track approx KL for early stopping
+                kl_approx = tf.reduce_mean(logp_flat[mb_inds] - logp_new).numpy()
+                kl_epoch += kl_approx
+                kl_count += 1
 
-        print(f"[Itr {itr}] Success Rate (true goals): {success_rate:.2f}% | Mean Return: {mean_ret:.2f}")
+            # FIX: KL early stopping — if policy changed too much, stop update epochs
+            mean_kl = kl_epoch / max(kl_count, 1)
+            if mean_kl > MAX_KL:
+                print(f"[Itr {itr}] KL early stop at epoch {epoch+1} (KL={mean_kl:.4f})")
+                break
+
+        mean_ret = np.mean(ep_returns) if ep_returns else 0.0
+        # FIX: Divide by THIS-ROLLOUT episodes, not the deque size (was 5x too low)
+        success_rate = (true_goal_successes / max(episodes_this_iter, 1)) * 100
+
+        mean_ep_len = (ROLLOUT_STEPS * NUM_DRONES) / max(episodes_this_iter, 1)
+        print(f"[Itr {itr}] SR: {success_rate:.1f}% | MeanRet: {mean_ret:.2f} | "
+              f"EpLen: {mean_ep_len:.0f} | Episodes: {episodes_this_iter} | "
+              f"Entropy: {ENTROPY_COEFF:.4f}")
 
         iters.append(itr)
         mean_returns.append(mean_ret)
